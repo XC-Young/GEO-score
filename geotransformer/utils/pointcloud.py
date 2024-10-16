@@ -1,5 +1,5 @@
 from typing import Tuple, List, Optional, Union, Any
-
+import torch
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
@@ -15,7 +15,7 @@ def get_nearest_neighbor(
 ):
     r"""Compute the nearest neighbor for the query points in support points."""
     s_tree = cKDTree(s_points)
-    distances, indices = s_tree.query(q_points, k=1, n_jobs=-1)
+    distances, indices = s_tree.query(q_points, k=1, workers=-1)
     if return_index:
         return distances, indices
     else:
@@ -36,6 +36,14 @@ def regularize_normals(points, normals, positive=True):
         normals = normals * (1 - direction) - normals * direction
     return normals
 
+def pc_normalize(pc0,pc1):
+    centroid = torch.mean(pc0, dim=0)
+    pc0 = pc0 - centroid
+    pc1 = pc1 - centroid
+    m = torch.sqrt(torch.sum(pc0**2, dim=1)).max()
+    pc0 = pc0 / m
+    pc1 = pc1 / m
+    return pc0,pc1
 
 # Transformation Utilities
 

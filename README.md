@@ -87,8 +87,12 @@ CUDA_VISIBLE_DEVICES=0 ./eval.sh EPOCH 3DLoMatch
 We also provide pretrained weights in `weights`, use the following command to test the pretrained weights.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python test.py --snapshot=./weights/geotransformer-3dmatch.pth.tar --benchmark=3DMatch
-CUDA_VISIBLE_DEVICES=0 python eval.py --benchmark=3DMatch --method=lgr
+CUDA_VISIBLE_DEVICES=0 python experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/test.py --snapshot=./weights/geotransformer-3dmatch.pth.tar --benchmark=3DMatch
+CUDA_VISIBLE_DEVICES=0 python experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/eval.py --benchmark=3DMatch --method=lgr
+
+CUDA_VISIBLE_DEVICES=0 python experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/test.py --snapshot=./weights/geotransformer-3dmatch.pth.tar --benchmark=3DLoMatch
+CUDA_VISIBLE_DEVICES=0 python experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/eval.py --benchmark=3DLoMatch --method=lgr
+python experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/eval.py --benchmark=3DLoMatch --method=myransac --score=False
 ```
 
 Replace `3DMatch` with `3DLoMatch` to evaluate on 3DLoMatch.

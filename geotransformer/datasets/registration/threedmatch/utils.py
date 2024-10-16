@@ -105,7 +105,7 @@ def write_log_file(file_name, test_pairs):
     lines = []
     for test_pair in test_pairs:
         frag_id0, frag_id1 = test_pair['test_pair']
-        lines.append('{}\t{}\t{}\n'.format(frag_id0, frag_id1, test_pair['num_fragments']))
+        lines.append('{}\t{}\t{}\t{}\n'.format(frag_id0, frag_id1, test_pair['num_fragments'], test_pair['ir']))
         rows = test_pair['transform'].tolist()
         for row in rows:
             lines.append('{}\t{}\t{}\t{}\n'.format(row[0], row[1], row[2], row[3]))

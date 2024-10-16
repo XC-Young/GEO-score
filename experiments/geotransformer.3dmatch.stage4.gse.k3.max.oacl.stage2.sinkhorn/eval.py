@@ -2,20 +2,24 @@ import argparse
 import os.path as osp
 import time
 import glob
-import sys
+import sys,os
 import json
-
+import open3d as o3d
 import torch
 import numpy as np
-
+from multiprocessing import Pool
+from functools import partial
+from tqdm import tqdm
 from geotransformer.engine import Logger
 from geotransformer.modules.registration import weighted_procrustes
 from geotransformer.utils.summary_board import SummaryBoard
 from geotransformer.utils.open3d import registration_with_ransac_from_correspondences
+from geotransformer.utils.pointcloud import apply_transform
 from geotransformer.utils.registration import (
     evaluate_sparse_correspondences,
     evaluate_correspondences,
     compute_registration_error,
+    compute_inlier_ratio,
 )
 from geotransformer.datasets.registration.threedmatch.utils import (
     get_num_fragments,
@@ -23,8 +27,13 @@ from geotransformer.datasets.registration.threedmatch.utils import (
     get_gt_logs_and_infos,
     compute_transform_error,
     write_log_file,
+    ensure_dir
 )
 
+from score.utils.data import precompute_data_stack_mode
+from geotransformer.utils.torch import to_cuda
+from score.model import create_model
+from score.config import make_cfg_score
 from config import make_cfg
 
 
@@ -32,11 +41,169 @@ def make_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_epoch', default=None, type=int, help='test epoch')
     parser.add_argument('--benchmark', choices=['3DMatch', '3DLoMatch'], required=True, help='test benchmark')
-    parser.add_argument('--method', choices=['lgr', 'ransac', 'svd'], required=True, help='registration method')
+    parser.add_argument('--method', choices=['lgr', 'ransac', 'svd', 'myransac'], required=True, help='registration method')
+    parser.add_argument('--score', action='store_true')
+    parser.add_argument('--toptest', action='store_true')
+    parser.add_argument('--weight', default='./score/weights/epoch-2-0.723.pth.tar',type=str)
     parser.add_argument('--num_corr', type=int, default=None, help='number of correspondences for registration')
     parser.add_argument('--verbose', action='store_true', help='verbose mode')
     return parser
 
+def Threepps2Trans(kps0_init,kps1_init):
+    centre0 = np.mean(kps0_init,0,keepdims=True)
+    centre1 = np.mean(kps1_init,0,keepdims=True)
+    m = (kps1_init-centre1).T @ (kps0_init-centre0)
+    U,S,VT = np.linalg.svd(m)
+    rotation = VT.T @ U.T 
+    offset =centre0 - (centre1 @ rotation.T)
+    transform = np.concatenate([rotation,offset.T],1)
+    transform = np.concatenate([transform,[[0.0,0.0,0.0,1.0]]],axis=0)
+    return transform
+
+def cal_trans(args, save_dir, filename):
+    ref_frame, src_frame = [int(x) for x in osp.basename(filename).split('.')[0].split('_')]
+    data_dict = np.load(filename)
+    ref_corr_points = data_dict['ref_corr_points']
+    src_corr_points = data_dict['src_corr_points']
+    max_iter = 5000
+    top_num = 10
+    iter_cal = 0
+    best_ir = 0
+    best_trans = np.eye(4)
+    if args.score:
+        top_trans = []
+        while iter_cal<max_iter:
+            single_trans = {
+                'trans':[],
+                'inlier_ratio':float}
+            iter_cal += 1
+            idxs_init = np.random.choice(range(ref_corr_points.shape[0]),3)
+            kps0_init = ref_corr_points[idxs_init]
+            kps1_init = src_corr_points[idxs_init]
+
+            trans = Threepps2Trans(kps0_init,kps1_init)
+            inlier_ratio = compute_inlier_ratio(ref_corr_points,src_corr_points,trans,positive_radius=0.1)
+            single_trans['trans'] = trans
+            single_trans['inlier_ratio'] = inlier_ratio
+            if iter_cal <= top_num:
+                top_trans.append(single_trans)
+            else:
+                for i in range(top_num):
+                    if single_trans['inlier_ratio'] > top_trans[i]['inlier_ratio']:
+                        top_trans[i] = single_trans
+                        break
+        top_trans = sorted(top_trans, key=lambda x:x["inlier_ratio"], reverse=True)
+        np.savez(f'{save_dir}/{ref_frame}-{src_frame}.npz',top_trans=top_trans)
+    else:
+        while iter_cal<max_iter:
+            iter_cal += 1
+            idxs_init = np.random.choice(range(ref_corr_points.shape[0]),3)
+            kps0_init = ref_corr_points[idxs_init]
+            kps1_init = src_corr_points[idxs_init]
+            trans = Threepps2Trans(kps0_init,kps1_init)
+            inlier_ratio = compute_inlier_ratio(ref_corr_points,src_corr_points,trans,positive_radius=0.1)
+            if inlier_ratio>best_ir:
+                best_ir = inlier_ratio
+                best_trans = trans
+        np.savez(f'{save_dir}/{ref_frame}-{src_frame}.npz',trans = best_trans, ir = best_ir)     
+
+def load_snapshot(model, snapshot):
+    print('Loading from "{}".'.format(snapshot))
+    state_dict = torch.load(snapshot, map_location=torch.device('cpu'))
+    assert 'model' in state_dict, 'No model can be loaded.'
+    model.load_state_dict(state_dict['model'], strict=True)
+    print('Model has been loaded.')
+
+class score:
+    def __init__(self,args):
+        self.args = args
+        self.max_time = 10
+        self.point_limit = 30000
+        self.neighbor_limits = np.array([41, 36, 34, 15])
+        model_cfg = make_cfg_score()
+        self.model = create_model(model_cfg).cuda()
+        load_snapshot(self.model,args.weight)
+        self.model.eval()
+
+    def dict_pre(self,data_dict):
+        collated_dict = {}
+        # array to tensor
+        for key, value in data_dict.items():
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(value)
+            if key not in collated_dict:
+                collated_dict[key] = []
+            collated_dict[key].append(value)
+
+        # handle special keys: [ref_feats, src_feats] -> feats, [ref_points, src_points] -> points, lengths
+        feats = torch.cat(collated_dict.pop('ref_feats') + collated_dict.pop('src_feats'), dim=0)
+        points_list = collated_dict.pop('ref_points') + collated_dict.pop('src_points')
+        lengths = torch.LongTensor([points.shape[0] for points in points_list])
+        points = torch.cat(points_list, dim=0)
+        # remove wrapping brackets
+        for key, value in collated_dict.items():
+            collated_dict[key] = value[0]
+        collated_dict['features'] = feats
+        input_dict = precompute_data_stack_mode(points, lengths, num_stages=4, voxel_size=0.025, 
+                                                radius=0.0625, neighbor_limits = self.neighbor_limits, point_num=128)
+        collated_dict.update(input_dict)
+        return(collated_dict)
+
+    def score(self, cfg, file_names,scene_name):
+        save_dir = f'{cfg.registration_dir}/top_trans/{self.args.benchmark}/{scene_name}'
+        trans_dir = f'{cfg.registration_dir}/score_trans/{self.args.benchmark}/{scene_name}'
+        ensure_dir(trans_dir)
+        for filename in tqdm(file_names):
+            ref_frame, src_frame = [int(x) for x in osp.basename(filename).split('.')[0].split('_')]
+            data_dict = np.load(filename)
+            if os.path.exists(f'{trans_dir}/{ref_frame}-{src_frame}.npz'):continue
+            top_trans = np.load(f'{save_dir}/{ref_frame}-{src_frame}.npz',allow_pickle=True)['top_trans']
+            pc_dir = f'{cfg.data.dataset_root}/data/test/{scene_name}'
+            pc0 = torch.load(f'{pc_dir}/cloud_bin_{ref_frame}.pth')
+            pcd0 = o3d.geometry.PointCloud()
+            pcd0.points = o3d.utility.Vector3dVector(pc0)
+            pcd0 = pcd0.voxel_down_sample(0.025)
+            pcd0 = np.array(pcd0.points)
+            pc1 = torch.load(f'{pc_dir}/cloud_bin_{src_frame}.pth')
+            pcd1 = o3d.geometry.PointCloud()
+            pcd1.points = o3d.utility.Vector3dVector(pc1)
+            pcd1 = pcd1.voxel_down_sample(0.025)
+            pcd1 = np.array(pcd1.points)
+            data_dict = {}
+            data_dict['ref_points'] = pcd0.astype(np.float32)
+            data_dict['ref_feats'] = np.ones((pcd0.shape[0], 1), dtype=np.float32)
+            data_dict['src_feats'] = np.ones((pcd1.shape[0], 1), dtype=np.float32)
+            score = 0
+            iter_time = 0
+            trans_idx = 0
+            save_trans = np.eye(4)
+            save_score = 0
+            save_overlap = 0
+            # save_weight = 0
+            while iter_time < self.max_time:
+                if trans_idx >= len(top_trans):break
+                trans = top_trans[trans_idx]['trans']
+                overlap = top_trans[trans_idx]['inlier_ratio']
+                rre,rte = compute_registration_error(save_trans,trans)
+                trans_idx += 1
+                if iter_time > 0 and rre < 10 and rte < 1:continue
+                pcd1 = apply_transform(pcd1,trans)
+                data_dict['src_points'] = pcd1.astype(np.float32)
+                collated_dict = self.dict_pre(data_dict)
+                collated_dict = to_cuda(collated_dict)
+                cls_logits = self.model(collated_dict)
+                score = torch.sigmoid(cls_logits).detach().cpu().item()
+                # weight = score*overlap
+                torch.cuda.empty_cache()
+                if score > save_score:
+                    save_trans = trans
+                    save_score = score
+                    save_overlap = overlap
+                    # save_weight = weight
+                pcd1 = apply_transform(pcd1, np.linalg.inv(trans))
+                iter_time += 1
+            np.savez(f'{trans_dir}/{ref_frame}-{src_frame}.npz', trans=save_trans, score=save_score, 
+                     overlap=save_overlap, iter_time=iter_time)
 
 def eval_one_epoch(args, cfg, logger):
     features_root = osp.join(cfg.feature_dir, args.benchmark)
@@ -77,6 +244,33 @@ def eval_one_epoch(args, cfg, logger):
     scene_registration_result_dict = {}
 
     scene_roots = sorted(glob.glob(osp.join(features_root, '*')))
+    if args.method == 'myransac':
+        for scene_root in scene_roots:
+            scene_name = osp.basename(scene_root)
+            file_names = sorted(
+                glob.glob(osp.join(scene_root, '*.npz')),
+                key=lambda x: [int(i) for i in osp.basename(x).split('.')[0].split('_')],)
+
+            if args.score:
+                save_dir = f'{cfg.registration_dir}/top_trans/{args.benchmark}/{scene_name}'
+            else:
+                save_dir = f'{cfg.registration_dir}/trans/{args.benchmark}/{scene_name}'
+            ensure_dir(save_dir)
+            pool = Pool(len(file_names))
+            func = partial(cal_trans,args,save_dir)
+            list(tqdm(pool.imap(func,file_names),total=len(file_names)))
+            pool.close()
+            pool.join()
+    if args.score:
+        scorer = score(args)
+        print('Using Scorer-geo to score transformations.')
+        for scene_root in tqdm(scene_roots):
+            scene_name = osp.basename(scene_root)
+            file_names = sorted(
+                glob.glob(osp.join(scene_root, '*.npz')),
+                key=lambda x: [int(i) for i in osp.basename(x).split('.')[0].split('_')],)
+            scorer.score(cfg,file_names,scene_name)
+            
     for scene_root in scene_roots:
         coarse_matching_meter.reset_meter('scene_precision')
         coarse_matching_meter.reset_meter('scene_PMR>0')
@@ -182,6 +376,22 @@ def eval_one_epoch(args, cfg, logger):
                         src_corr_points, ref_corr_points, corr_scores, return_transform=True
                     )
                     estimated_transform = estimated_transform.detach().cpu().numpy()
+            elif args.method == 'myransac':
+                if args.score:
+                    estimated_transform = np.load(f'{cfg.registration_dir}/score_trans/{args.benchmark}/{scene_name}/{ref_frame}-{src_frame}.npz',allow_pickle=True)['trans']
+                elif args.toptest:
+                    top_trans = np.load(f'{cfg.registration_dir}/top_trans/{args.benchmark}/{scene_name}/{ref_frame}-{src_frame}.npz',allow_pickle=True)['top_trans']
+                    gt_index = gt_indices[ref_frame, src_frame]
+                    transform = gt_logs[gt_index]['transform']
+                    for i in range(len(top_trans)):
+                        trans = top_trans[i]['trans']
+                        rre, rte = compute_registration_error(transform, trans)
+                        if i==0:
+                            estimated_transform = trans
+                        elif i>0 and rre<15 and rte<0.3:
+                            estimated_transform = trans
+                else:
+                    estimated_transform = np.load(f'{cfg.registration_dir}/trans/{args.benchmark}/{scene_name}/{ref_frame}-{src_frame}.npz',allow_pickle=True)['trans']
             else:
                 raise ValueError(f'Unsupported registration method: {args.method}.')
 
@@ -190,6 +400,7 @@ def eval_one_epoch(args, cfg, logger):
                     test_pair=[ref_frame, src_frame],
                     num_fragments=num_fragments,
                     transform=estimated_transform,
+                    ir = inlier_ratio,
                 )
             )
 

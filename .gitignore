@@ -3,3 +3,5 @@ data
 .vscode
 weights
 output
+geotransformer.egg-info
+build
