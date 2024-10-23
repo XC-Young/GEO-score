@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from geotransformer.modules.ops.pairwise_distance import pairwise_distance
-from geotransformer.utils.pointcloud import pc_normalize
+from geotransformer.utils.pointcloud import pc_normalize,apply_transform_tensor
 from geotransformer.modules.geotransformer import (
     GeometricTransformer,
 )
@@ -13,8 +13,6 @@ from score.backbone import KPConvFPN
 class GeoTransformer(nn.Module):
     def __init__(self, cfg):
         super(GeoTransformer, self).__init__()
-        self.dual_normalization = cfg.model.dual_normalization
-        self.num_classes = cfg.model.num_classes
 
         self.backbone = KPConvFPN(
             cfg.backbone.input_dim,
@@ -36,16 +34,6 @@ class GeoTransformer(nn.Module):
             cfg.geotransformer.sigma_a,
             cfg.geotransformer.angle_k,
             reduction_a=cfg.geotransformer.reduction_a,
-        )
-
-        self.cls_head = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.GroupNorm(cfg.model.group_norm,256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 128),
-            nn.GroupNorm(cfg.model.group_norm,128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, self.num_classes),
         )
 
     def forward(self, data_dict):
@@ -73,9 +61,34 @@ class GeoTransformer(nn.Module):
         ) # 1,128,256
         ref_feats_c_norm = F.normalize(ref_feats_c.squeeze(0), p=2, dim=1)
         src_feats_c_norm = F.normalize(src_feats_c.squeeze(0), p=2, dim=1)
+        return ref_feats_c_norm,src_feats_c_norm
+
+class Scorer(nn.Module):
+    def __init__(self, cfg):
+        super(Scorer, self).__init__()
+        self.num_classes = cfg.model.num_classes
+
+        self.cls_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.GroupNorm(cfg.model.group_norm,256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 128),
+            nn.GroupNorm(cfg.model.group_norm,128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, self.num_classes),
+        )
+
+    def forward(self, data_dict, ref_feats_c_norm,src_feats_c_norm, trans):
+        ref_length_c = data_dict['lengths'][-1][0].item()
+        points_c = data_dict['points'][-1].detach()
+
+        ref_points_c = points_c[:ref_length_c]
+        src_points_c = points_c[ref_length_c:]
+        src_points_c = apply_transform_tensor(src_points_c, trans)
+
         ref_points_c_norm,src_points_c_norm = pc_normalize(ref_points_c,src_points_c)
 
-        # 4. get the nearest point's spatial dist and feature dist
+        # 1. get the nearest point's spatial dist and feature dist
         dist_mat = torch.exp(-pairwise_distance(ref_points_c_norm,src_points_c_norm))
         match_idx_ref = dist_mat.max(dim=1)[1] # index of each ref_point's NN point in src (Returns the index of min in each row)
         match_idx_src = dist_mat.max(dim=0)[1] # index of each src_point's NN point in ref (Returns the index of min in each column)
@@ -92,7 +105,7 @@ class GeoTransformer(nn.Module):
         dist_ref = dist_mat[range(dist_mat.shape[0]),feat_match_idx_ref]
         dist_src = dist_mat[feat_match_idx_src,range(dist_mat.shape[0])]
 
-        # 5. classifier
+        # 2. classifier
         # Spatial Distance Nearest Points and Corresponding Feature Scores
         min_dist = torch.cat([min_dist_ref,min_dist_src])
         feat_score = torch.cat([feat_score_ref,feat_score_src])
@@ -111,17 +124,23 @@ class GeoTransformer(nn.Module):
         return cls_logits
 
 
-def create_model(config):
+def create_geo_model(config):
     model = GeoTransformer(config)
     return model
 
+def create_score_model(config):
+    model = Scorer(config)
+    return model
 
 def main():
     from config import make_cfg
     cfg = make_cfg()
-    model = create_model(cfg)
-    print(model.state_dict().keys())
-    print(model)
+    geo_model = create_geo_model(cfg)
+    score_model = create_score_model(cfg)
+    print(geo_model.state_dict().keys())
+    print(geo_model)
+    print(score_model.state_dict().keys())
+    print(score_model)
 
 
 if __name__ == '__main__':

@@ -92,7 +92,7 @@ CUDA_VISIBLE_DEVICES=0 python experiments/geotransformer.3dmatch.stage4.gse.k3.m
 
 CUDA_VISIBLE_DEVICES=0 python experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/test.py --snapshot=./weights/geotransformer-3dmatch.pth.tar --benchmark=3DLoMatch
 CUDA_VISIBLE_DEVICES=0 python experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/eval.py --benchmark=3DLoMatch --method=lgr
-python experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/eval.py --benchmark=3DLoMatch --method=myransac --score=False
+python experiments/geotransformer.3dmatch.stage4.gse.k3.max.oacl.stage2.sinkhorn/eval.py --benchmark=3DLoMatch --method=myransac --score
 ```
 
 Replace `3DMatch` with `3DLoMatch` to evaluate on 3DLoMatch.

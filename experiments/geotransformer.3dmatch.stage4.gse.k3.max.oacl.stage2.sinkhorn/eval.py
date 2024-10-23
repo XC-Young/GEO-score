@@ -32,7 +32,7 @@ from geotransformer.datasets.registration.threedmatch.utils import (
 
 from score.utils.data import precompute_data_stack_mode
 from geotransformer.utils.torch import to_cuda
-from score.model import create_model
+from score.model import create_geo_model,create_score_model
 from score.config import make_cfg_score
 from config import make_cfg
 
@@ -44,7 +44,8 @@ def make_parser():
     parser.add_argument('--method', choices=['lgr', 'ransac', 'svd', 'myransac'], required=True, help='registration method')
     parser.add_argument('--score', action='store_true')
     parser.add_argument('--toptest', action='store_true')
-    parser.add_argument('--weight', default='./score/weights/epoch-2-0.723.pth.tar',type=str)
+    parser.add_argument('--ir', action='store_true')
+    parser.add_argument('--weight', default='./score/weights/epoch-2.pth.tar',type=str)
     parser.add_argument('--num_corr', type=int, default=None, help='number of correspondences for registration')
     parser.add_argument('--verbose', action='store_true', help='verbose mode')
     return parser
@@ -66,7 +67,7 @@ def cal_trans(args, save_dir, filename):
     ref_corr_points = data_dict['ref_corr_points']
     src_corr_points = data_dict['src_corr_points']
     max_iter = 5000
-    top_num = 10
+    top_num = 100
     iter_cal = 0
     best_ir = 0
     best_trans = np.eye(4)
@@ -107,23 +108,32 @@ def cal_trans(args, save_dir, filename):
                 best_trans = trans
         np.savez(f'{save_dir}/{ref_frame}-{src_frame}.npz',trans = best_trans, ir = best_ir)     
 
-def load_snapshot(model, snapshot):
+def load_snapshot(geo_model,score_model, snapshot):
     print('Loading from "{}".'.format(snapshot))
     state_dict = torch.load(snapshot, map_location=torch.device('cpu'))
     assert 'model' in state_dict, 'No model can be loaded.'
-    model.load_state_dict(state_dict['model'], strict=True)
+    geo_params,score_params = {},{}
+    for key, value in state_dict['model'].items():
+        if key.startswith('backbone.') or key.startswith('transformer.'):
+            geo_params[key] = value
+        elif key.startswith('cls_head.'):
+            score_params[key] = value
+    geo_model.load_state_dict(geo_params, strict=True)
+    score_model.load_state_dict(score_params, strict=True)
     print('Model has been loaded.')
 
 class score:
     def __init__(self,args):
         self.args = args
-        self.max_time = 10
+        self.max_time = 100
         self.point_limit = 30000
         self.neighbor_limits = np.array([41, 36, 34, 15])
         model_cfg = make_cfg_score()
-        self.model = create_model(model_cfg).cuda()
-        load_snapshot(self.model,args.weight)
-        self.model.eval()
+        self.geo_model = create_geo_model(model_cfg).cuda()
+        self.score_model = create_score_model(model_cfg).cuda()
+        load_snapshot(self.geo_model,self.score_model,args.weight)
+        self.geo_model.eval()
+        self.score_model.eval()
 
     def dict_pre(self,data_dict):
         collated_dict = {}
@@ -171,27 +181,26 @@ class score:
             pcd1 = np.array(pcd1.points)
             data_dict = {}
             data_dict['ref_points'] = pcd0.astype(np.float32)
+            data_dict['src_points'] = pcd1.astype(np.float32)
             data_dict['ref_feats'] = np.ones((pcd0.shape[0], 1), dtype=np.float32)
             data_dict['src_feats'] = np.ones((pcd1.shape[0], 1), dtype=np.float32)
+            collated_dict = self.dict_pre(data_dict)
+            collated_dict = to_cuda(collated_dict)
+            ref_feats_c_norm,src_feats_c_norm = self.geo_model(collated_dict)
             score = 0
             iter_time = 0
             trans_idx = 0
             save_trans = np.eye(4)
             save_score = 0
             save_overlap = 0
-            # save_weight = 0
+            save_weight = 0
             while iter_time < self.max_time:
                 if trans_idx >= len(top_trans):break
                 trans = top_trans[trans_idx]['trans']
                 overlap = top_trans[trans_idx]['inlier_ratio']
-                rre,rte = compute_registration_error(save_trans,trans)
                 trans_idx += 1
-                if iter_time > 0 and rre < 10 and rte < 1:continue
-                pcd1 = apply_transform(pcd1,trans)
-                data_dict['src_points'] = pcd1.astype(np.float32)
-                collated_dict = self.dict_pre(data_dict)
-                collated_dict = to_cuda(collated_dict)
-                cls_logits = self.model(collated_dict)
+                trans_g = to_cuda(torch.from_numpy(trans))                
+                cls_logits = self.score_model(collated_dict,ref_feats_c_norm,src_feats_c_norm,trans_g)
                 score = torch.sigmoid(cls_logits).detach().cpu().item()
                 # weight = score*overlap
                 torch.cuda.empty_cache()
@@ -378,7 +387,7 @@ def eval_one_epoch(args, cfg, logger):
                     estimated_transform = estimated_transform.detach().cpu().numpy()
             elif args.method == 'myransac':
                 if args.score:
-                    estimated_transform = np.load(f'{cfg.registration_dir}/score_trans/{args.benchmark}/{scene_name}/{ref_frame}-{src_frame}.npz',allow_pickle=True)['trans']
+                    estimated_transform = np.load(f'{cfg.registration_dir}/weight_trans/{args.benchmark}/{scene_name}/{ref_frame}-{src_frame}.npz',allow_pickle=True)['trans']
                 elif args.toptest:
                     top_trans = np.load(f'{cfg.registration_dir}/top_trans/{args.benchmark}/{scene_name}/{ref_frame}-{src_frame}.npz',allow_pickle=True)['top_trans']
                     gt_index = gt_indices[ref_frame, src_frame]
@@ -388,8 +397,13 @@ def eval_one_epoch(args, cfg, logger):
                         rre, rte = compute_registration_error(transform, trans)
                         if i==0:
                             estimated_transform = trans
+                            save_rre = rre
                         elif i>0 and rre<15 and rte<0.3:
-                            estimated_transform = trans
+                            if rre<save_rre:
+                                estimated_transform = trans
+                elif args.ir:
+                    top_trans = np.load(f'{cfg.registration_dir}/top_trans/{args.benchmark}/{scene_name}/{ref_frame}-{src_frame}.npz',allow_pickle=True)['top_trans']
+                    estimated_transform = top_trans[0]['trans']
                 else:
                     estimated_transform = np.load(f'{cfg.registration_dir}/trans/{args.benchmark}/{scene_name}/{ref_frame}-{src_frame}.npz',allow_pickle=True)['trans']
             else:

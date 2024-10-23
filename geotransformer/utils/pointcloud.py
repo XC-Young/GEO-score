@@ -57,7 +57,17 @@ def apply_transform(points: np.ndarray, transform: np.ndarray, normals: Optional
         return points, normals
     else:
         return points
-
+    
+def apply_transform_tensor(points: torch.Tensor, transform: torch.Tensor, normals: Optional[torch.Tensor] = None):
+    transform = transform.float()
+    rotation = transform[:3, :3]
+    translation = transform[:3, 3]
+    points = torch.matmul(points, rotation.T) + translation
+    if normals is not None:
+        normals = torch.matmul(normals, rotation.T)
+        return points, normals
+    else:
+        return points
 
 def compose_transforms(transforms: List[np.ndarray]) -> np.ndarray:
     r"""
